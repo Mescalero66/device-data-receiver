@@ -45,10 +45,15 @@ The window shows:
 - **Charts**: ppm per sensor over the chosen window. Hollow circles are
   provisional readings (boot-calibration R0, `tracking=0`), red crosses are
   readings with no ppm, dotted lines are board restarts. Hover for values.
+  *Fix axis* starts each Y axis at zero (up to the highest reading shown or the
+  clean-air level), so small noise does not look like big swings; it and
+  *Log scale* are alternatives, so ticking one unticks the other.
   *Import CSV...* adds logs from earlier runs to the charts (see below);
   *Clear charts* empties them without touching the log files.
 - **Events**: restarts, rejected lines (with the reason, e.g. checksum
-  mismatch), deviations from the spec, stale sensors and link loss.
+  mismatch), deviations from the spec, stale sensors and link loss. Untick
+  *Events* above the charts to hide this pane and give the charts the room;
+  events are still recorded, and the box counts new ones until you show it again.
 - **Status line**: counts of lines, valid sentences, rejects and readings, plus
   the estimated board uptime.
 

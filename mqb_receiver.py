@@ -199,7 +199,7 @@ def run_gui(args):
                 self.tree.insert("", "end", iid=n, values=(n,))
             self.tree.pack(fill="x", padx=8)
 
-            panes = ttk.PanedWindow(root, orient="vertical")
+            self.panes = panes = ttk.PanedWindow(root, orient="vertical")
             panes.pack(fill="both", expand=True, padx=8, pady=8)
 
             plot_frame = ttk.Frame(panes)
@@ -213,9 +213,19 @@ def run_gui(args):
             box.bind("<<ComboboxSelected>>", lambda e: self._mark_dirty())
             self.log_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(ctl, text="Log scale", variable=self.log_var,
-                            command=self._mark_dirty).pack(side="left", padx=8)
+                            command=lambda: self._set_scale(self.log_var, self.fixed_var)
+                            ).pack(side="left", padx=8)
             ttk.Button(ctl, text="Import CSV...", command=self._import).pack(side="left", padx=(8, 4))
             ttk.Button(ctl, text="Clear charts", command=self._clear_charts).pack(side="left")
+            self.events_var = tk.BooleanVar(value=True)
+            self.events_label = tk.StringVar(value="Events")
+            self.unseen = 0                 # events logged while the pane is hidden
+            ttk.Checkbutton(ctl, textvariable=self.events_label, variable=self.events_var,
+                            command=self._toggle_events).pack(side="left", padx=12)
+            self.fixed_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(ctl, text="Fix axis", variable=self.fixed_var,
+                            command=lambda: self._set_scale(self.fixed_var, self.log_var)
+                            ).pack(side="left")
             ttk.Label(ctl, text="Hover a chart for values. Plotted at receive time (within ~10s of the reading).",
                       style="Status.TLabel").pack(side="right")
 
@@ -235,7 +245,7 @@ def run_gui(args):
             ], loc="outside upper center", ncols=5, frameon=False, fontsize=9, labelcolor=INK_2)
             panes.add(plot_frame, weight=4)
 
-            log_frame = ttk.Frame(panes)
+            self.log_frame = log_frame = ttk.Frame(panes)
             ttk.Label(log_frame, text="Events").pack(anchor="w")
             self.log = ScrolledText(log_frame, height=8, font=("Consolas", 9), wrap="none",
                                     background=SURFACE, foreground=INK, relief="flat")
@@ -406,6 +416,13 @@ def run_gui(args):
         def _mark_dirty(self):
             self.plot_dirty = True
 
+        def _set_scale(self, ticked, other):
+            # A log axis cannot start at zero, so Log scale and Fix axis
+            # are alternatives: ticking one unticks the other.
+            if ticked.get():
+                other.set(False)
+            self._mark_dirty()
+
         def _add_log(self, level, text):
             self.log.configure(state="normal")
             self.log.insert("end", "%s  %-7s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -414,6 +431,19 @@ def run_gui(args):
                 self.log.delete("1.0", "500.0")
             self.log.see("end")
             self.log.configure(state="disabled")
+            if not self.events_var.get():
+                self.unseen += 1
+                self.events_label.set("Events (%d new)" % self.unseen)
+
+        def _toggle_events(self):
+            # Hiding only takes the pane off screen; events are still recorded.
+            if self.events_var.get():
+                self.panes.add(self.log_frame, weight=1)
+                self.log.see("end")
+                self.unseen = 0
+                self.events_label.set("Events")
+            else:
+                self.panes.forget(self.log_frame)
 
         # table & status -----------------------------------------------
         def _refresh_table(self):
@@ -521,6 +551,11 @@ def run_gui(args):
                                                              ec="none", alpha=0.85))
                 if self.log_var.get():
                     ax.set_yscale("log")
+                elif self.fixed_var.get():
+                    # Zero-based, so steady readings look steady rather than
+                    # small noise filling the whole height.
+                    top = max([p for e, p, trk in pts if p is not None] + [CLEAN_AIR_PPM[n]])
+                    ax.set_ylim(0, top * 1.1)
                 # Fill the window as data arrives rather than showing a mostly
                 # empty 6 h axis for the first few minutes.
                 first = min(p[0] for h in self.history.values() for p in h[:1])
