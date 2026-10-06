@@ -4,20 +4,21 @@
     python mqb_receiver.py --port COM7          GUI, connect straight away
     python mqb_receiver.py --cli --port COM7    console only
     python mqb_receiver.py --sim                GUI fed by a simulated board
+    python mqb_receiver.py --modbus-sim         Modbus tab fed by a simulated sensor
 
 New readings are appended to data/mqb_YYYY-MM-DD.csv (simulator runs go to
 data/sim/). See README.md for details.
 """
 
 import argparse
-import math
 import os
 import queue
 import sys
 import time
 from datetime import datetime
 
-from mqb_core import HealthWatch, Receiver, SerialSource, SimSource, list_ports, read_csv_logs
+from mqb_core import (HealthWatch, Receiver, SerialSource, SimSource, list_ports, merge_points,
+                      read_csv_logs)
 from mqb_protocol import CLEAN_AIR_PPM, CYCLE_S, GAS, GAS_NAME, SENSORS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,47 +100,28 @@ def run_cli(args):
 
 # --- GUI --------------------------------------------------------------------------
 
-# Light theme tokens (chart surface, inks, hairlines) and the series/status hues.
-SURFACE = "#fcfcfb"
-PAGE = "#f9f9f7"
-INK = "#0b0b0b"
-INK_2 = "#52514e"
-MUTED = "#898781"
-GRID = "#e1e0d9"
-AXIS = "#c3c2b7"
-SERIES = "#2a78d6"
-CRITICAL = "#d03b3b"
-LOG_COLORS = {"error": CRITICAL, "reject": CRITICAL, "restart": "#4a3aa7",
-              "warning": "#9a6a00", "notice": INK_2, "info": INK}
-WINDOWS = [("1 hour", 3600), ("6 hours", 6 * 3600), ("24 hours", 86400),
-           ("7 days", 7 * 86400), ("All", None)]
 MAX_HISTORY = 20000             # readings kept per sensor for plotting (~35 days)
 
 
 def run_gui(args):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-    from tkinter.scrolledtext import ScrolledText
 
-    import matplotlib
-    matplotlib.use("TkAgg")
-    import matplotlib.dates as mdates
+    from gui_common import (CRITICAL, INK_2, MUTED, PAGE, SERIES, SURFACE, WINDOWS, TabBase)
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
+    from modbus_tab import ModbusTab
 
-    class App:
-        def __init__(self, root):
-            self.root = root
-            self.q = queue.Queue()
+    class UartTab(TabBase):
+        def __init__(self, root, frame, notebook):
+            super().__init__(root, frame, notebook)
             self.rx = None
             self.watch = None
             self.port = None
             self.history = {n: [] for n in SENSORS}     # (rx_time, ppm, tracking, temp_c)
             self.restarts = []
             self.latest = {}
-            self.plot_dirty = True
-            self.hover = {}
             self._build()
             self._refresh_ports()
             if args.csv:
@@ -153,19 +135,11 @@ def run_gui(args):
                 self._connect()
             root.after(200, self._poll)
             root.after(1000, self._tick)
-            root.protocol("WM_DELETE_WINDOW", self._close)
 
         # layout -------------------------------------------------------
         def _build(self):
-            root = self.root
-            root.title("MQ Board Receiver")
-            root.geometry("1320x900")
-            root.minsize(900, 600)
-            style = ttk.Style()
-            style.configure("Treeview", rowheight=24)
-            style.configure("Status.TLabel", foreground=INK_2)
-
-            bar = ttk.Frame(root, padding=(8, 8, 8, 4))
+            frame = self.frame
+            bar = ttk.Frame(frame, padding=(8, 8, 8, 4))
             bar.pack(fill="x")
             ttk.Label(bar, text="Port").pack(side="left")
             self.port_var = tk.StringVar()
@@ -181,12 +155,12 @@ def run_gui(args):
             ttk.Label(bar, textvariable=self.file_var, style="Status.TLabel").pack(side="right", padx=8)
 
             self.status_var = tk.StringVar(value="")
-            ttk.Label(root, textvariable=self.status_var, style="Status.TLabel",
+            ttk.Label(frame, textvariable=self.status_var, style="Status.TLabel",
                       padding=(8, 0, 8, 4)).pack(fill="x")
 
             # The table takes the width of two chart columns and the board
             # temperature chart the third, both as tall as the table's 6 rows.
-            top = ttk.Frame(root)
+            top = ttk.Frame(frame)
             top.pack(fill="x", padx=8)
             top.columnconfigure(0, weight=2, uniform="top")
             top.columnconfigure(1, weight=1, uniform="top")
@@ -220,7 +194,7 @@ def run_gui(args):
             self.temp_canvas.get_tk_widget().grid(row=0, column=1, sticky="nsew", padx=(8, 0))
             self.temp_canvas.mpl_connect("motion_notify_event", self._on_hover)
 
-            self.panes = panes = ttk.PanedWindow(root, orient="vertical")
+            panes = ttk.PanedWindow(frame, orient="vertical")
             panes.pack(fill="both", expand=True, padx=8, pady=8)
 
             plot_frame = ttk.Frame(panes)
@@ -238,11 +212,7 @@ def run_gui(args):
                             ).pack(side="left", padx=8)
             ttk.Button(ctl, text="Import CSV...", command=self._import).pack(side="left", padx=(8, 4))
             ttk.Button(ctl, text="Clear charts", command=self._clear_charts).pack(side="left")
-            self.events_var = tk.BooleanVar(value=True)
-            self.events_label = tk.StringVar(value="Events")
-            self.unseen = 0                 # events logged while the pane is hidden
-            ttk.Checkbutton(ctl, textvariable=self.events_label, variable=self.events_var,
-                            command=self._toggle_events).pack(side="left", padx=12)
+            self._events_checkbox(ctl).pack(side="left", padx=12)
             self.fixed_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(ctl, text="Fix axis", variable=self.fixed_var,
                             command=lambda: self._set_scale(self.fixed_var, self.log_var)
@@ -265,16 +235,7 @@ def run_gui(args):
                 Line2D([], [], color=MUTED, lw=1, ls=":", label="board restart"),
             ], loc="outside upper center", ncols=5, frameon=False, fontsize=9, labelcolor=INK_2)
             panes.add(plot_frame, weight=4)
-
-            self.log_frame = log_frame = ttk.Frame(panes)
-            ttk.Label(log_frame, text="Events").pack(anchor="w")
-            self.log = ScrolledText(log_frame, height=8, font=("Consolas", 9), wrap="none",
-                                    background=SURFACE, foreground=INK, relief="flat")
-            self.log.pack(fill="both", expand=True)
-            for level, color in LOG_COLORS.items():
-                self.log.tag_configure(level, foreground=color)
-            self.log.configure(state="disabled")
-            panes.add(log_frame, weight=1)
+            self._build_events(panes)
 
         # connection ---------------------------------------------------
         def _refresh_ports(self):
@@ -316,10 +277,9 @@ def run_gui(args):
             os.makedirs(folder, exist_ok=True)
             os.startfile(folder)
 
-        def _close(self):
+        def shutdown(self):
             if self.rx:
                 self.rx.stop()
-            self.root.destroy()
 
         # imported logs ------------------------------------------------
         def _import(self, paths=None):
@@ -335,17 +295,11 @@ def run_gui(args):
             except (OSError, ValueError) as e:
                 messagebox.showerror("Import CSV", str(e), parent=self.root)
                 return
-            # Merge in time order. CSV times are whole seconds of the live
-            # receive time, so int() matches a reading already on the charts.
+            # Merge in time order, skipping readings already on the charts.
             added = 0
             for n, new in points.items():
-                h = self.history[n]
-                seen = {int(p[0]) for p in h}
-                fresh = [p for p in new if int(p[0]) not in seen]
-                added += len(fresh)
-                h.extend(fresh)
-                h.sort(key=lambda p: p[0])
-                del h[:-MAX_HISTORY]
+                added += merge_points(self.history[n], new)
+                del self.history[n][:-MAX_HISTORY]
             # A live restart is logged on the first empty sentence, an imported
             # one at the first reading after it, so allow for the difference.
             for rt in restarts:
@@ -429,13 +383,10 @@ def run_gui(args):
                     self._add_log(level, text)
             self._refresh_table()
             self._refresh_status(now)
-            if self.plot_dirty:
+            if self.plot_dirty and self.visible():
                 self.plot_dirty = False
                 self._draw()
             self.root.after(1000, self._tick)
-
-        def _mark_dirty(self):
-            self.plot_dirty = True
 
         def _set_scale(self, ticked, other):
             # A log axis cannot start at zero, so Log scale and Fix axis
@@ -443,28 +394,6 @@ def run_gui(args):
             if ticked.get():
                 other.set(False)
             self._mark_dirty()
-
-        def _add_log(self, level, text):
-            self.log.configure(state="normal")
-            self.log.insert("end", "%s  %-7s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                                     level, text), level)
-            if int(self.log.index("end-1c").split(".")[0]) > 3000:
-                self.log.delete("1.0", "500.0")
-            self.log.see("end")
-            self.log.configure(state="disabled")
-            if not self.events_var.get():
-                self.unseen += 1
-                self.events_label.set("Events (%d new)" % self.unseen)
-
-        def _toggle_events(self):
-            # Hiding only takes the pane off screen; events are still recorded.
-            if self.events_var.get():
-                self.panes.add(self.log_frame, weight=1)
-                self.log.see("end")
-                self.unseen = 0
-                self.events_label.set("Events")
-            else:
-                self.panes.forget(self.log_frame)
 
         # table & status -----------------------------------------------
         def _refresh_table(self):
@@ -529,13 +458,8 @@ def run_gui(args):
             end = self._view_end(time.time())
             span = dict(WINDOWS)[self.window_var.get()]
             t0 = end - span if span else None
-            # Fill the window as data arrives rather than showing a mostly
-            # empty 6 h axis for the first few minutes.
             firsts = [h[0][0] for h in self.history.values() if h]
-            xlim = None
-            if firsts:
-                left = max(t0, min(firsts)) if t0 is not None else min(firsts)
-                xlim = (datetime.fromtimestamp(left - 60), datetime.fromtimestamp(end + 30))
+            xlim = self._xlim(min(firsts), t0, end) if firsts else None
             self.hover.clear()
             for ax, n in zip(self.axes.flat, SENSORS):
                 ax.clear()
@@ -546,7 +470,7 @@ def run_gui(args):
                 if not pts:
                     self._waiting(ax)
                     continue
-                self._line(ax, [(e, p) for e, p, trk, tc in pts])
+                self._line(ax, [(e, p) for e, p, trk, tc in pts], 2.5 * CYCLE_S)
                 prov = [(datetime.fromtimestamp(e), p) for e, p, trk, tc in pts
                         if trk is False and p is not None]
                 if prov:
@@ -565,8 +489,7 @@ def run_gui(args):
                     # small noise filling the whole height.
                     ax.set_ylim(0, max([p for e, p in valid] + [CLEAN_AIR_PPM[n]]) * 1.1)
                 ax.set_xlim(*xlim)
-                self.hover[ax] = ("ppm", [(mdates.date2num(datetime.fromtimestamp(e)), e, p, trk)
-                                          for e, p, trk, tc in pts])
+                self._set_hover(ax, "ppm", [(e, p, trk) for e, p, trk, tc in pts], "no ppm (read fault)")
             self._draw_temperature(t0, xlim)
             self.tip = None
             self.canvas.draw_idle()
@@ -584,97 +507,50 @@ def run_gui(args):
             if not pts:
                 self._waiting(ax)
                 return
-            self._line(ax, pts)
+            self._line(ax, pts, 2.5 * CYCLE_S)
             self._latest(ax, pts, 8)
             if self.fixed_var.get():
                 # Log scale does not apply here: temperatures can be zero or below.
-                temps = [tc for e, tc in pts]
-                ax.set_ylim(min(0, min(temps) * 1.1), max(1, max(temps) * 1.1))
+                self._zero_based(ax, [tc for e, tc in pts])
             ax.set_xlim(*xlim)
-            self.hover[ax] = ("\N{DEGREE SIGN}C", [(mdates.date2num(datetime.fromtimestamp(e)), e, tc, None)
-                                                   for e, tc in pts])
-
-        def _line(self, ax, pts):
-            # Break the line across missing values and across gaps longer
-            # than two read cycles, so it never bridges missing data.
-            xs, ys, prev = [], [], None
-            for t, v in pts:
-                if prev is not None and t - prev > 2.5 * CYCLE_S:
-                    xs.append(datetime.fromtimestamp(prev + 1))
-                    ys.append(math.nan)
-                xs.append(datetime.fromtimestamp(t))
-                ys.append(math.nan if v is None else v)
-                prev = t
-            ax.plot(xs, ys, color=SERIES, lw=2, solid_capstyle="round", zorder=3)
-
-        def _latest(self, ax, valid, fontsize):
-            """Mark and label the newest value of a time-ordered [(epoch, value)]."""
-            if not valid:
-                return
-            e, v = valid[-1]
-            ax.plot([datetime.fromtimestamp(e)], [v], marker="o", markersize=8, color=SERIES,
-                    markeredgecolor=SURFACE, markeredgewidth=2, zorder=5)
-            ax.annotate("%.2f" % v, (datetime.fromtimestamp(e), v), xytext=(-8, 8),
-                        textcoords="offset points", ha="right", color=INK, fontsize=fontsize,
-                        fontweight="bold", bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE,
-                                                     ec="none", alpha=0.85))
+            self._set_hover(ax, "\N{DEGREE SIGN}C", [(e, tc, None) for e, tc in pts])
 
         def _restart_lines(self, ax, t0):
             for rt in self.restarts:
                 if t0 is None or rt >= t0:
                     ax.axvline(datetime.fromtimestamp(rt), color=MUTED, lw=1, ls=":")
 
-        def _waiting(self, ax):
-            ax.text(0.5, 0.5, "waiting for readings", transform=ax.transAxes,
-                    ha="center", va="center", color=MUTED, fontsize=9)
-
-        def _style(self, ax, title):
-            ax.set_facecolor(SURFACE)
-            ax.set_title(title, loc="left", fontsize=10, color=INK)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            for side in ("left", "bottom"):
-                ax.spines[side].set_color(AXIS)
-            ax.tick_params(colors=MUTED, labelsize=8, length=3)
-            ax.grid(axis="y", color=GRID, lw=0.8)
-            ax.set_axisbelow(True)
-            loc = mdates.AutoDateLocator(minticks=3)
-            ax.xaxis.set_major_locator(loc)
-            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
-
-        def _on_hover(self, event):
-            if self.tip is not None:
-                # The tip may be on the other canvas, so redraw the one it is on.
-                self.tip.figure.canvas.draw_idle()
-                self.tip.remove()
-                self.tip = None
-            data = self.hover.get(event.inaxes)
-            if data and event.xdata is not None:
-                unit, pts = data
-                x, t, v, trk = min(pts, key=lambda p: abs(p[0] - event.xdata))
-                text = "%s\n%s" % (datetime.fromtimestamp(t).strftime("%d %b %H:%M:%S"),
-                                   "no ppm (read fault)" if v is None else "%.2f %s" % (v, unit))
-                if trk is False:
-                    text += "\nprovisional"
-                ax = event.inaxes
-                y = v if v is not None else ax.get_ylim()[0]
-                left = event.x > ax.bbox.x0 + ax.bbox.width * 0.6
-                self.tip = ax.annotate(
-                    text, (x, y), xytext=(-10 if left else 10, 10), textcoords="offset points",
-                    ha="right" if left else "left", fontsize=8, color=INK, zorder=10,
-                    bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=AXIS),
-                    arrowprops=dict(arrowstyle="-", color=MUTED))
-            event.canvas.draw_idle()
-
     root = tk.Tk()
-    app = App(root)
-    app.tip = None
+    root.title("Device Data Receiver")
+    root.geometry("1320x900")
+    root.minsize(900, 600)
+    style = ttk.Style()
+    style.configure("Treeview", rowheight=24)
+    style.configure("Status.TLabel", foreground=INK_2)
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+    uart_frame, modbus_frame = ttk.Frame(notebook), ttk.Frame(notebook)
+    notebook.add(uart_frame, text="  UART  ")
+    notebook.add(modbus_frame, text="  Modbus  ")
+    tabs = [UartTab(root, uart_frame, notebook),
+            ModbusTab(root, modbus_frame, notebook, args.out, args.modbus_settings,
+                      connect=args.modbus, sim=args.modbus_sim)]
+    if (args.modbus or args.modbus_sim) and not (args.sim or args.port or args.csv):
+        notebook.select(modbus_frame)
+
+    def close():
+        for tab in tabs:
+            tab.shutdown()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close)
     root.mainloop()
     return 0
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Receive, display and log MQ gas sensor board broadcasts.")
+    p = argparse.ArgumentParser(description="Receive, display and log MQ gas sensor board broadcasts (UART) "
+                                            "and Modbus TCP devices.")
     p.add_argument("csv", nargs="*", help="CSV logs from earlier runs to show on the charts (window only)")
     p.add_argument("--port", help="serial port, e.g. COM7")
     p.add_argument("--cli", action="store_true", help="console only, no window")
@@ -682,6 +558,12 @@ def main(argv=None):
     p.add_argument("--raw", action="store_true", help="also log every received line to mqb_raw_<date>.log")
     p.add_argument("--sim", action="store_true", help="use a simulated board instead of a serial port")
     p.add_argument("--sim-speed", type=float, default=10, help="simulator time acceleration (default 10)")
+    p.add_argument("--modbus", action="store_true",
+                   help="start polling the Modbus device saved in the Modbus tab's settings")
+    p.add_argument("--modbus-sim", action="store_true",
+                   help="start the Modbus tab on a simulated environment sensor")
+    p.add_argument("--modbus-settings", default=os.path.join(HERE, "modbus_settings.json"),
+                   help="Modbus tab settings file (default: ./modbus_settings.json)")
     p.add_argument("--sim-faults", action="store_true",
                    help="simulate a fresh board with read faults, corrupted lines, a failed MQ4 "
                         "boot calibration and a restart at 15 min uptime")

@@ -224,3 +224,7 @@ data/*.csv
 data/*.log
 data/sim/*.csv
 data/sim/*.log
+
+# Modbus tab settings (per machine)
+modbus_settings.json
+modbus_settings.json.tmp

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime
 
-from mqb_core import CsvLogger, LineFramer, read_csv_logs
+from mqb_core import CsvLogger, LineFramer, merge_points, parse_time, read_csv_logs
 from mqb_protocol import (ParseError, Tracker, checksum, make_sentence, parse_sentence,
                           recompute_ppm)
 from mqb_sim import SimBoard
@@ -264,6 +264,86 @@ class CsvTests(unittest.TestCase):
         self.assertEqual(len(points["MQ4"]), 1)
         self.assertEqual(restarts, [t("2026-10-05 09:00:00")])
         self.assertEqual(skipped, 1)
+
+
+class ResavedLogTests(unittest.TestCase):
+    """Logs a spreadsheet has opened and saved again."""
+
+    # The same log with some rows re-saved without seconds, in another date
+    # style, and 0.40 written as 0.4; the 22:18 MQ5 row repeats the 22:17:30 one.
+    MIXED = [
+        ",".join(CSV_HEADER),
+        "2026-10-06 22:17:30,2026-10-06 22:17:28,MQ5,LPG,2776,0.40,16.31,0,4.223935,provisional",
+        "2026-10-06 22:18:01,2026-10-06 22:17:53,MQ8,H2,2801,52.58,16.31,0,0.631696,provisional",
+        "2026/10/06 22:18,2026/10/06 22:18,MQ2,SMK,2726,14.06,16.44,0,2.288774,provisional",
+        "2026/10/06 22:18,2026/10/06 22:18,MQ4,CH4,2751,17.88,16.44,0,8.085601,provisional",
+        "2026/10/06 22:18,2026/10/06 22:18,MQ5,LPG,2776,0.4,16.31,0,4.223935,provisional",
+        "2026/10/06 22:46:00,2026/10/06 22:46:00,MQ7,CO,4501,0.25,16.38,0,10.208116,provisional",
+        "2026/10/06 22:47:00,2026/10/06 22:47:00,MQ5,LPG,4576,0.39,16.25,0,4.223935,provisional",
+        "2026-10-06 22:50:37,2026-10-06 22:50:37,MQ5,LPG,4726,0.40,16.25,0,4.223935,provisional",
+    ]
+
+    def read(self, lines, delimiter=",", bom=False):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log.csv")
+            with open(path, "w", newline="", encoding="utf-8-sig" if bom else "utf-8") as fh:
+                fh.write("\r\n".join(l.replace(",", delimiter) for l in lines) + "\r\n")
+            return read_csv_logs([path])
+
+    def test_timestamp_styles(self):
+        base = datetime(2026, 10, 6, 22, 18, 31).timestamp()
+        for text in ("2026-10-06 22:18:31", "2026.10.06 22:18:31", "6/10/2026 22:18:31",
+                     "06-10-2026 22:18:31", "06/10/26 10:18:31 PM", " 2026/10/06  22:18:31 "):
+            self.assertEqual(parse_time(text), base, text)
+        self.assertEqual(parse_time("2026/10/06 22:18"), base - 31)
+        self.assertEqual(parse_time("2026-10-06T22:18:31.25"), base + 0.25)
+        self.assertEqual(parse_time("10/6/2026 22:18:31", day_first=False), base)
+        self.assertEqual(parse_time("6/10/2026 12:05 am"), datetime(2026, 10, 6, 0, 5).timestamp())
+        for bad in ("", "yesterday", "2026-10-06", "22:18:31", "2026-13-06 22:18", "206-10-06 22:18"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_time(bad)
+
+    def test_mixed_formats_in_one_file(self):
+        points, restarts, skipped = self.read(self.MIXED, bom=True)
+        self.assertEqual((restarts, skipped), ([], 0))
+        self.assertEqual(sum(len(p) for p in points.values()), 7)     # repeat dropped
+        mq5 = points["MQ5"]
+        self.assertEqual([round(p[1], 2) for p in mq5], [0.40, 0.39, 0.40])
+        self.assertEqual(mq5[0][0], parse_time("2026-10-06 22:17:30"))  # the first copy kept
+
+    def test_copies_do_not_look_like_restarts(self):
+        # From a real log: 22:44-22:46 saved twice, including the reading the
+        # program re-logged when it restarted at 22:46. Sorted by time, MQ2's
+        # t_s would run 4376, 4526, 4376 - a restart that never happened.
+        block = ["{0} 22:44{1},,MQ2,SMK,4376,14.01,16.56,0,2.288774,provisional",
+                 "{0} 22:46{1},,MQ2,SMK,4376,14.01,16.56,0,2.288774,provisional",
+                 "{0} 22:46{1},,MQ2,SMK,4526,13.99,16.25,0,2.288774,provisional"]
+        rows = ([",".join(CSV_HEADER)] + [r.format("2026/10/06", "") for r in block]
+                + [r.format("2026/10/06", ":00") for r in block])
+        points, restarts, skipped = self.read(rows)
+        self.assertEqual(restarts, [])
+        self.assertEqual([p[1] for p in points["MQ2"]], [14.01, 13.99])
+
+    def test_semicolon_separated(self):
+        points, restarts, skipped = self.read(self.MIXED, delimiter=";")
+        self.assertEqual((sum(len(p) for p in points.values()), skipped), (7, 0))
+
+    def test_month_first_decided_per_file(self):
+        rows = [",".join(CSV_HEADER),
+                "10/6/2026 09:00,,MQ2,SMK,26,12.00,20.00,0,2.1,",
+                "10/13/2026 09:00,,MQ2,SMK,176,12.50,20.00,0,2.1,"]   # only valid month first
+        points, restarts, skipped = self.read(rows)
+        self.assertEqual([datetime.fromtimestamp(p[0]).month for p in points["MQ2"]], [10, 10])
+
+    def test_merge_skips_copies(self):
+        t = parse_time("2026-10-06 22:18:31")
+        h = [(t, 14.06, False, 16.44)]
+        added = merge_points(h, [(t - 31, 14.06, False, 16.44),   # same reading, no seconds
+                                 (t + 150, 14.10, False, 16.44),  # next reading
+                                 (t - 300, None, False, 16.44)])  # earlier fault
+        self.assertEqual(added, 2)
+        self.assertEqual([p[0] - t for p in h], [-300, 0, 150])
+        self.assertEqual(merge_points(h, list(h)), 0)             # importing again adds nothing
 
 
 if __name__ == "__main__":

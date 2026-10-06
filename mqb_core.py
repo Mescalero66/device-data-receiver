@@ -2,8 +2,11 @@
 and the worker thread that ties them to the protocol Tracker.
 """
 
+import bisect
 import csv
+import io
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -11,7 +14,8 @@ from datetime import datetime
 import serial
 import serial.tools.list_ports
 
-from mqb_protocol import MAX_LINE, SENSORS, ParseError, Sentence, Tracker, parse_sentence
+from mqb_protocol import (CYCLE_S, MAX_LINE, SENSORS, ParseError, Sentence, Tracker,
+                          parse_sentence)
 
 BAUD = 115200
 ESPRESSIF_VID = 0x303A
@@ -160,7 +164,12 @@ def _fmt(v, spec):
 
 
 class DailyFile:
-    """An append-mode file per local day, named <prefix>_YYYY-MM-DD<ext>."""
+    """An append-mode file per local day, named <prefix>_YYYY-MM-DD<ext>.
+
+    If that day's file already has a different header (e.g. other Modbus
+    registers were logged earlier), it is left alone and <prefix>_YYYY-MM-DD_2
+    (then _3, ...) is used, so columns never get mixed.
+    """
 
     def __init__(self, folder, prefix, ext, header=None):
         self.folder, self.prefix, self.ext, self.header = folder, prefix, ext, header
@@ -168,12 +177,24 @@ class DailyFile:
         self.fh = None
         self.path = None
 
+    def _path_for(self, day):
+        n = 1
+        while True:
+            path = os.path.join(self.folder, "%s_%s%s%s" % (
+                self.prefix, day, "_%d" % n if n > 1 else "", self.ext))
+            if not self.header or not os.path.exists(path) or os.path.getsize(path) == 0:
+                return path
+            with open(path, newline="", encoding="ascii", errors="replace") as fh:
+                if fh.readline() == self.header:
+                    return path
+            n += 1
+
     def file_for(self, epoch):
         day = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
         if day != self.day:
             self.close()
             os.makedirs(self.folder, exist_ok=True)
-            self.path = os.path.join(self.folder, "%s_%s%s" % (self.prefix, day, self.ext))
+            self.path = self._path_for(day)
             new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
             self.fh = open(self.path, "a", newline="", encoding="ascii", errors="replace")
             if new and self.header:
@@ -213,12 +234,64 @@ class CsvLogger:
         self.daily.close()
 
 
+# A timestamp as written by CsvLogger, or as a spreadsheet re-saves it: date
+# parts separated by - / or . (year first, or day/month first with a 2- or
+# 4-digit year), then a time with or without seconds, optionally AM/PM.
+_STAMP = re.compile(r"""\s*(\d{1,4})[-/.](\d{1,2})[-/.](\d{1,4})
+                        [\sT]+(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?
+                        \s*([AaPp]\.?[Mm]\.?)?\s*$""", re.X)
+
+
+def parse_time(text, day_first=True):
+    """Epoch seconds for a timestamp in any of the forms _STAMP accepts.
+
+    `day_first` settles 06/10/2026: 6 October if true, June 10 if false.
+    Raises ValueError if the text is not a timestamp.
+    """
+    m = _STAMP.match(text or "")
+    if not m:
+        raise ValueError("unrecognised timestamp %r" % text)
+    a, b, c, hh, mm, ss, frac, ampm = m.groups()
+    if len(a) == 4:
+        year, month, day = int(a), int(b), int(c)
+    elif len(a) <= 2 and len(c) in (2, 4):
+        year = int(c) + (2000 if len(c) == 2 else 0)
+        day, month = (int(a), int(b)) if day_first else (int(b), int(a))
+    else:
+        raise ValueError("unrecognised date in %r" % text)
+    hour = int(hh)
+    if ampm:
+        hour = hour % 12 + (12 if ampm[0] in "Pp" else 0)
+    micro = int((frac or "0")[:6].ljust(6, "0"))
+    return datetime(year, month, day, hour, int(mm), int(ss or 0), micro).timestamp()
+
+
+def _day_first(stamps):
+    """Whether a file's day/month/year dates put the day first.
+
+    Decided per file, not per row, so 05/06 and 25/06 in one file are read the
+    same way. Day first unless a date only makes sense month first (e.g. 10/13).
+    """
+    month_first = False
+    for text in stamps:
+        m = _STAMP.match(text or "")
+        if m and len(m.group(1)) <= 2:
+            if int(m.group(1)) > 12:
+                return True
+            if int(m.group(2)) > 12:
+                month_first = True
+    return not month_first
+
+
 def read_csv_logs(paths):
     """Load readings back from CSV logs written by CsvLogger, for plotting.
 
-    Rows from all the files are replayed in time order through a Tracker, so
-    a reading logged twice (e.g. the program was restarted mid-cycle) counts
-    once, and board restarts are found as they were live, even between files.
+    Also reads logs a spreadsheet has re-saved: other date styles, times
+    without seconds, numbers like 0.4 for 0.40, a UTF-8 byte order mark and
+    ';' as the separator. Rows from all the files are replayed in time order
+    through a Tracker, so a reading logged twice (e.g. the program was
+    restarted mid-cycle, or rows saved in two formats) counts once, and board
+    restarts are found as they were live, even between files.
 
     Returns (points, restarts, skipped): points maps sensor -> time-ordered
     [(rx_time, ppm, tracking, temp_c)], restarts lists the times of detected board
@@ -227,35 +300,84 @@ def read_csv_logs(paths):
     """
     rows, skipped = [], 0
     for path in paths:
-        with open(path, newline="", encoding="ascii", errors="replace") as fh:
-            reader = csv.DictReader(fh)
-            missing = {"pc_time", "sensor", "t_s", "ppm"} - set(reader.fieldnames or ())
-            if missing:
-                raise ValueError("%s is not an MQB CSV log (no %s column)"
-                                 % (os.path.basename(path), ", ".join(sorted(missing))))
-            for row in reader:
-                try:
-                    rx = datetime.strptime(row["pc_time"], TIME_FMT).timestamp()
-                    ppm = float(row["ppm"]) if row["ppm"] else None
-                    temp = float(row["temp_c"]) if row.get("temp_c") else None
-                    tracking = {"1": True, "0": False}.get(row.get("tracking") or "")
-                    s = Sentence(row["sensor"], int(row["t_s"]), row.get("gas") or None,
-                                 ppm, temp, tracking, None)
-                except (TypeError, ValueError):     # short or garbled row
-                    skipped += 1
-                    continue
-                rows.append((rx, s))
+        with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
+            text = fh.read()
+        header = text.split("\n", 1)[0]
+        reader = csv.DictReader(io.StringIO(text),
+                                delimiter=";" if header.count(";") > header.count(",") else ",")
+        reader.fieldnames = [f.strip() for f in reader.fieldnames or ()]
+        missing = {"pc_time", "sensor", "t_s", "ppm"} - set(reader.fieldnames)
+        if missing:
+            raise ValueError("%s is not an MQB CSV log (no %s column)"
+                             % (os.path.basename(path), ", ".join(sorted(missing))))
+        file_rows = list(reader)
+        day_first = _day_first(r["pc_time"] for r in file_rows)
+        for row in file_rows:
+            try:
+                rx = parse_time(row["pc_time"], day_first)
+                ppm = float(row["ppm"]) if row["ppm"].strip() else None
+                temp = float(row["temp_c"]) if (row.get("temp_c") or "").strip() else None
+                tracking = {"1": True, "0": False}.get((row.get("tracking") or "").strip())
+                t_s = float(row["t_s"])
+                if t_s != int(t_s) or t_s < 0:
+                    raise ValueError("t_s is not a whole number")
+                s = Sentence(row["sensor"].strip(), int(t_s), (row.get("gas") or "").strip() or None,
+                             ppm, temp, tracking, None)
+            except (AttributeError, TypeError, ValueError, OverflowError):  # short or garbled row
+                skipped += 1
+                continue
+            rows.append((rx, s))
     rows.sort(key=lambda r: r[0])
+    # Keep only the first copy of each reading before replaying. Other copies
+    # (the program restarted mid-cycle, or rows saved twice in different
+    # formats) can carry a truncated time, sort among later readings and
+    # look like t_s going backwards, i.e. a board restart that never happened.
+    first_seen, unique = {}, []
+    for rx, s in rows:
+        key = (s.name, s.t_s, None if s.ppm is None else round(s.ppm, 2))
+        if key in first_seen and rx - first_seen[key] <= 2 * CYCLE_S:
+            continue
+        first_seen[key] = rx
+        unique.append((rx, s))
     tracker = Tracker()
     points = {n: [] for n in SENSORS}
     restarts = []
-    for rx, s in rows:
+    for rx, s in unique:
         up = tracker.feed(s, rx)
         if up.restart:
             restarts.append(rx)
         if up.reading:
             points[s.name].append((rx, s.ppm, s.tracking, s.temp_c))
     return points, restarts, skipped
+
+
+SAME_READING_S = 60     # a re-saved log may have lost the seconds
+
+
+def merge_points(existing, new):
+    """Add one sensor's `new` points to its time-ordered `existing` list.
+
+    A point already there is skipped: same ppm within SAME_READING_S seconds.
+    (A sensor's readings are 150 s apart, so that can only be another copy of
+    the same reading, e.g. live and imported, or saved without seconds.)
+    Returns the number added; `existing` stays time-ordered.
+    """
+    def key(ppm):
+        return None if ppm is None else round(ppm, 2)
+
+    times = [p[0] for p in existing]
+    fresh = []
+    for p in new:
+        i = bisect.bisect_left(times, p[0] - SAME_READING_S)
+        while i < len(times) and times[i] <= p[0] + SAME_READING_S:
+            if key(existing[i][1]) == key(p[1]):
+                break
+            i += 1
+        else:
+            fresh.append(p)
+    existing.extend(fresh)
+    existing.sort(key=lambda p: p[0])
+    return len(fresh)
 
 
 class RawLogger:

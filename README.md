@@ -1,8 +1,13 @@
 # Device Data Receiver
 
-PC software for the MQ gas sensor board's UART broadcast (`$PMQB` sentences,
-see [https://github.com/Mescalero66/mq-board-micropython/blob/main/INTERFACE.md](INTERFACE.md)). It shows the six sensors live and appends
-every new reading to a daily CSV file.
+PC software with two tabs, which can both run at the same time:
+
+- **UART**: the MQ gas sensor board's UART broadcast (`$PMQB` sentences, see
+  [INTERFACE.md](https://github.com/Mescalero66/mq-board-micropython/blob/main/INTERFACE.md)).
+  It shows the six sensors live and appends every new reading to a daily CSV file.
+- **Modbus**: polls registers from a Modbus TCP device (e.g. the PowerTec Pico
+  environment sensor), graphs up to six of them and logs every poll to a daily CSV
+  file. See [Modbus tab](#modbus-tab).
 
 ## Setup
 
@@ -32,11 +37,13 @@ Double-click `run.bat`, or:
     python mqb_receiver.py --sim                # simulated board, no hardware needed
     python mqb_receiver.py --sim --sim-faults   # simulated faults, bad checksums and a restart
     python mqb_receiver.py data\mqb_2026-10-04.csv   # window showing an earlier log on the charts
+    python mqb_receiver.py --modbus             # also start polling the saved Modbus device
+    python mqb_receiver.py --modbus-sim         # Modbus tab on a simulated sensor
 
 Other options: `--raw` also logs every received line verbatim; `--out DIR`
 changes the log folder (default `data/`); `--sim-speed N` speeds up the simulator.
 
-The window shows:
+The **UART** tab shows:
 
 - **Table**: the latest sentence per sensor. *vs clean air* is ppm divided by the
   sensor's datasheet clean-air floor; *Since reading* should never exceed
@@ -80,6 +87,43 @@ with whatever is already shown:
 
 Imported data only goes on the charts; it is never written back to the logs.
 
+## Modbus tab
+
+Polls one block of registers from a Modbus TCP device every few seconds. It
+runs independently of the UART tab, so both keep receiving, logging and
+charting whichever tab is showing.
+
+1. Enter the **Device IP**, **Port** (normally 502) and **Unit ID** (often
+   ignored by the device; 1 is usual), what to **Read** (holding registers,
+   input registers, coils or discrete inputs), the first register (**from**)
+   and how many (**count**, up to 125 registers per poll), then **Connect**.
+   *Poll every* can be changed while connected.
+2. The register table lists every polled register with its raw value and hex,
+   live. Register numbers are protocol addresses as in the device's
+   documentation (0-based); *Ref* shows the same register in the 1-based
+   `40001` style.
+3. For each of the six graphs, choose a **Register**, a **Name**, what it
+   **Shows** (temperature, humidity, ppm or ppb), the **Format** (`uint16`,
+   `int16`, or `uint32`/`int32`/`float32` over two registers, high word first)
+   and a **Scale**. Choosing what it shows fills in the usual format and scale
+   (temperature: `int16` x 0.1). Charts re-plot their whole history straight
+   away when these change, so use the raw values in the table to check a scale.
+
+Settings are saved to `modbus_settings.json` and restored next time. The
+defaults suit the PowerTec Pico environment sensor with one sensor of each
+kind: Temp 01 (register 10, x 0.1), Humi 01 (11), AQS1 eCO2 (30, ppm) and
+AQS1 TVOC (31, ppb). The humidity scale is not documented; if the table shows
+e.g. `455` for 45.5 %RH, set its scale to 0.1.
+
+If the device stops answering, the tab keeps retrying and says so once in
+Events. Some devices refuse to read a block that includes registers they do not
+define; the tab then reads the registers one at a time (shown in the status
+line) and leaves the undefined ones blank.
+
+Tick **Simulated device** (or start with `--modbus-sim`) to try it without
+hardware: a simulated environment sensor runs on this PC, and its logs go to
+`data/sim/`.
+
 ## Log files
 
 `data/mqb_YYYY-MM-DD.csv` gets one row per **new** reading. The board repeats
@@ -103,12 +147,25 @@ With `--raw` (or the *Also log raw lines* box), `data/mqb_raw_YYYY-MM-DD.log`
 records every line with a millisecond timestamp and a verdict (`ok`, `WARN ...`
 or `REJECT ...`). This is useful for checking the firmware against the spec.
 
+`data/modbus_<ip>_YYYY-MM-DD.csv` gets one row per successful Modbus poll:
+`pc_time`, then one column per register with its **raw** value (before format
+and scale), named by type and address, e.g. `hr10` for holding register 10
+(`ir` input, `co` coil, `di` discrete input). Empty = that register could not
+be read. Raw values mean any register can be graphed later, whatever the graph
+setup was. If you poll a different set of registers on the same day, a new
+file (`..._2.csv`) is started rather than mixing columns.
+
 ## Files
 
 | File               | Contents                                                        |
 |--------------------|-----------------------------------------------------------------|
-| `mqb_receiver.py`  | entry point: GUI and console mode                               |
+| `mqb_receiver.py`  | entry point: window (UART tab) and console mode                 |
 | `mqb_core.py`      | serial port, line framing, CSV/raw logs and import, background receiver |
 | `mqb_protocol.py`  | sentence parsing and validation, new-reading/restart tracking   |
 | `mqb_sim.py`       | simulated board (`python mqb_sim.py` prints a sample stream)    |
+| `gui_common.py`    | window parts both tabs share: theme, Events pane, chart styling, hover |
+| `modbus_tab.py`    | the Modbus tab                                                  |
+| `modbus_core.py`   | Modbus TCP client, value decoding, polling thread, CSV log, settings |
+| `modbus_sim.py`    | simulated environment sensor (`python modbus_sim.py` serves it on port 5020) |
 | `test_mqb.py`      | tests, including every example in INTERFACE.md: `python -m unittest -v` |
+| `test_modbus.py`   | Modbus tests, run against the simulated sensor over real sockets |
