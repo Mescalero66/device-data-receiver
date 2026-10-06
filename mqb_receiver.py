@@ -135,7 +135,7 @@ def run_gui(args):
             self.rx = None
             self.watch = None
             self.port = None
-            self.history = {n: [] for n in SENSORS}     # (rx_time, ppm, tracking)
+            self.history = {n: [] for n in SENSORS}     # (rx_time, ppm, tracking, temp_c)
             self.restarts = []
             self.latest = {}
             self.plot_dirty = True
@@ -184,11 +184,20 @@ def run_gui(args):
             ttk.Label(root, textvariable=self.status_var, style="Status.TLabel",
                       padding=(8, 0, 8, 4)).pack(fill="x")
 
-            cols = [("sensor", "Sensor", 70), ("gas", "Gas", 150), ("ppm", "ppm", 80),
-                    ("ratio", "vs clean air", 90), ("temp", "Temp C", 70),
-                    ("tracking", "R0 basis", 110), ("r0", "R0 kOhm", 90), ("t_s", "t_s", 80),
-                    ("age", "Since new reading", 120), ("status", "Status", 260)]
-            self.tree = ttk.Treeview(root, columns=[c[0] for c in cols], show="headings", height=6)
+            # The table takes the width of two chart columns and the board
+            # temperature chart the third, both as tall as the table's 6 rows.
+            top = ttk.Frame(root)
+            top.pack(fill="x", padx=8)
+            top.columnconfigure(0, weight=2, uniform="top")
+            top.columnconfigure(1, weight=1, uniform="top")
+            table_box = ttk.Frame(top)
+            table_box.grid(row=0, column=0, sticky="nsew")
+
+            cols = [("sensor", "Sensor", 50), ("gas", "Gas", 130), ("ppm", "ppm", 58),
+                    ("ratio", "vs clean air", 70), ("temp", "Temp C", 50),
+                    ("tracking", "R0 basis", 95), ("r0", "R0 kOhm", 64), ("t_s", "t_s", 54),
+                    ("age", "Since reading", 84), ("status", "Status", 200)]
+            self.tree = ttk.Treeview(table_box, columns=[c[0] for c in cols], show="headings", height=6)
             for key, title, width in cols:
                 self.tree.heading(key, text=title)
                 anchor = "e" if key in ("ppm", "ratio", "temp", "r0", "t_s") else "w"
@@ -197,7 +206,19 @@ def run_gui(args):
             self.tree.tag_configure("warn", background="#fdf0d0")
             for n in SENSORS:
                 self.tree.insert("", "end", iid=n, values=(n,))
-            self.tree.pack(fill="x", padx=8)
+            self.tree.pack(fill="both", expand=True)
+            # Size the row by the table's height only; the columns' widths come
+            # from the 2:1 split, not from what the table or chart request.
+            table_box.update_idletasks()
+            table_box.configure(width=1, height=self.tree.winfo_reqheight())
+            table_box.pack_propagate(False)
+
+            self.temp_fig = Figure(figsize=(4, 1.7), facecolor=PAGE, layout="constrained")
+            self.temp_ax = self.temp_fig.subplots()
+            self.temp_canvas = FigureCanvasTkAgg(self.temp_fig, master=top)
+            self.temp_canvas.get_tk_widget().configure(width=1, height=1)
+            self.temp_canvas.get_tk_widget().grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+            self.temp_canvas.mpl_connect("motion_notify_event", self._on_hover)
 
             self.panes = panes = ttk.PanedWindow(root, orient="vertical")
             panes.pack(fill="both", expand=True, padx=8, pady=8)
@@ -387,7 +408,7 @@ def run_gui(args):
                     elif kind == "reading":
                         s = payload.sentence
                         h = self.history[s.name]
-                        h.append((payload.rx_time, s.ppm, s.tracking))
+                        h.append((payload.rx_time, s.ppm, s.tracking, s.temp_c))
                         del h[:-MAX_HISTORY]
                         self.plot_dirty = True
                     elif kind == "log":
@@ -508,67 +529,108 @@ def run_gui(args):
             end = self._view_end(time.time())
             span = dict(WINDOWS)[self.window_var.get()]
             t0 = end - span if span else None
+            # Fill the window as data arrives rather than showing a mostly
+            # empty 6 h axis for the first few minutes.
+            firsts = [h[0][0] for h in self.history.values() if h]
+            xlim = None
+            if firsts:
+                left = max(t0, min(firsts)) if t0 is not None else min(firsts)
+                xlim = (datetime.fromtimestamp(left - 60), datetime.fromtimestamp(end + 30))
             self.hover.clear()
             for ax, n in zip(self.axes.flat, SENSORS):
                 ax.clear()
-                self._style(ax, n)
+                self._style(ax, "%s  -  %s ppm" % (n, GAS_NAME[GAS[n]]))
                 pts = [p for p in self.history[n] if t0 is None or p[0] >= t0]
                 ax.axhline(CLEAN_AIR_PPM[n], color=MUTED, lw=1, ls=(0, (4, 3)), zorder=1)
-                for rt in self.restarts:
-                    if t0 is None or rt >= t0:
-                        ax.axvline(datetime.fromtimestamp(rt), color=MUTED, lw=1, ls=":")
+                self._restart_lines(ax, t0)
                 if not pts:
-                    ax.text(0.5, 0.5, "waiting for readings", transform=ax.transAxes,
-                            ha="center", va="center", color=MUTED, fontsize=9)
+                    self._waiting(ax)
                     continue
-                # Break the line across faults and across gaps longer than
-                # two read cycles, so it never bridges missing data.
-                xs, ys, prev = [], [], None
-                for t, ppm, trk in pts:
-                    if prev is not None and t - prev > 2.5 * CYCLE_S:
-                        xs.append(datetime.fromtimestamp(prev + 1))
-                        ys.append(math.nan)
-                    xs.append(datetime.fromtimestamp(t))
-                    ys.append(math.nan if ppm is None else ppm)
-                    prev = t
-                ax.plot(xs, ys, color=SERIES, lw=2, solid_capstyle="round", zorder=3)
-                prov = [(datetime.fromtimestamp(e), p) for e, p, trk in pts if trk is False and p is not None]
+                self._line(ax, [(e, p) for e, p, trk, tc in pts])
+                prov = [(datetime.fromtimestamp(e), p) for e, p, trk, tc in pts
+                        if trk is False and p is not None]
                 if prov:
                     ax.plot(*zip(*prov), lw=0, marker="o", markersize=6, color=SERIES,
                             markerfacecolor=SURFACE, markeredgewidth=1.5, zorder=4)
-                faults = [datetime.fromtimestamp(e) for e, p, trk in pts if p is None]
+                faults = [datetime.fromtimestamp(e) for e, p, trk, tc in pts if p is None]
                 if faults:
                     ax.plot(faults, [0.04] * len(faults), transform=ax.get_xaxis_transform(), lw=0,
                             marker="x", markersize=7, markeredgewidth=1.5, color=CRITICAL, zorder=4)
-                valid = [(e, p) for e, p, trk in pts if p is not None]
-                if valid:
-                    e, p = valid[-1]
-                    ax.plot([datetime.fromtimestamp(e)], [p], marker="o", markersize=8, color=SERIES,
-                            markeredgecolor=SURFACE, markeredgewidth=2, zorder=5)
-                    ax.annotate("%.2f" % p, (datetime.fromtimestamp(e), p), xytext=(-8, 8),
-                                textcoords="offset points", ha="right", color=INK, fontsize=9,
-                                fontweight="bold", bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE,
-                                                             ec="none", alpha=0.85))
+                valid = [(e, p) for e, p, trk, tc in pts if p is not None]
+                self._latest(ax, valid, 9)
                 if self.log_var.get():
                     ax.set_yscale("log")
                 elif self.fixed_var.get():
                     # Zero-based, so steady readings look steady rather than
                     # small noise filling the whole height.
-                    top = max([p for e, p, trk in pts if p is not None] + [CLEAN_AIR_PPM[n]])
-                    ax.set_ylim(0, top * 1.1)
-                # Fill the window as data arrives rather than showing a mostly
-                # empty 6 h axis for the first few minutes.
-                first = min(p[0] for h in self.history.values() for p in h[:1])
-                left = max(t0, first) if t0 is not None else first
-                ax.set_xlim(datetime.fromtimestamp(left - 60), datetime.fromtimestamp(end + 30))
-                self.hover[ax] = (n, [(mdates.date2num(datetime.fromtimestamp(e)), e, p, trk)
-                                      for e, p, trk in pts])
+                    ax.set_ylim(0, max([p for e, p in valid] + [CLEAN_AIR_PPM[n]]) * 1.1)
+                ax.set_xlim(*xlim)
+                self.hover[ax] = ("ppm", [(mdates.date2num(datetime.fromtimestamp(e)), e, p, trk)
+                                          for e, p, trk, tc in pts])
+            self._draw_temperature(t0, xlim)
             self.tip = None
             self.canvas.draw_idle()
+            self.temp_canvas.draw_idle()
 
-        def _style(self, ax, n):
+        def _draw_temperature(self, t0, xlim):
+            # The board has one temperature sensor and every sentence carries
+            # its value, so all sensors' readings together make one series.
+            ax = self.temp_ax
+            ax.clear()
+            self._style(ax, "Board temperature  -  \N{DEGREE SIGN}C")
+            pts = sorted((e, tc) for h in self.history.values() for e, p, trk, tc in h
+                         if tc is not None and (t0 is None or e >= t0))
+            self._restart_lines(ax, t0)
+            if not pts:
+                self._waiting(ax)
+                return
+            self._line(ax, pts)
+            self._latest(ax, pts, 8)
+            if self.fixed_var.get():
+                # Log scale does not apply here: temperatures can be zero or below.
+                temps = [tc for e, tc in pts]
+                ax.set_ylim(min(0, min(temps) * 1.1), max(1, max(temps) * 1.1))
+            ax.set_xlim(*xlim)
+            self.hover[ax] = ("\N{DEGREE SIGN}C", [(mdates.date2num(datetime.fromtimestamp(e)), e, tc, None)
+                                                   for e, tc in pts])
+
+        def _line(self, ax, pts):
+            # Break the line across missing values and across gaps longer
+            # than two read cycles, so it never bridges missing data.
+            xs, ys, prev = [], [], None
+            for t, v in pts:
+                if prev is not None and t - prev > 2.5 * CYCLE_S:
+                    xs.append(datetime.fromtimestamp(prev + 1))
+                    ys.append(math.nan)
+                xs.append(datetime.fromtimestamp(t))
+                ys.append(math.nan if v is None else v)
+                prev = t
+            ax.plot(xs, ys, color=SERIES, lw=2, solid_capstyle="round", zorder=3)
+
+        def _latest(self, ax, valid, fontsize):
+            """Mark and label the newest value of a time-ordered [(epoch, value)]."""
+            if not valid:
+                return
+            e, v = valid[-1]
+            ax.plot([datetime.fromtimestamp(e)], [v], marker="o", markersize=8, color=SERIES,
+                    markeredgecolor=SURFACE, markeredgewidth=2, zorder=5)
+            ax.annotate("%.2f" % v, (datetime.fromtimestamp(e), v), xytext=(-8, 8),
+                        textcoords="offset points", ha="right", color=INK, fontsize=fontsize,
+                        fontweight="bold", bbox=dict(boxstyle="round,pad=0.2", fc=SURFACE,
+                                                     ec="none", alpha=0.85))
+
+        def _restart_lines(self, ax, t0):
+            for rt in self.restarts:
+                if t0 is None or rt >= t0:
+                    ax.axvline(datetime.fromtimestamp(rt), color=MUTED, lw=1, ls=":")
+
+        def _waiting(self, ax):
+            ax.text(0.5, 0.5, "waiting for readings", transform=ax.transAxes,
+                    ha="center", va="center", color=MUTED, fontsize=9)
+
+        def _style(self, ax, title):
             ax.set_facecolor(SURFACE)
-            ax.set_title("%s  -  %s ppm" % (n, GAS_NAME[GAS[n]]), loc="left", fontsize=10, color=INK)
+            ax.set_title(title, loc="left", fontsize=10, color=INK)
             for side in ("top", "right"):
                 ax.spines[side].set_visible(False)
             for side in ("left", "bottom"):
@@ -582,25 +644,27 @@ def run_gui(args):
 
         def _on_hover(self, event):
             if self.tip is not None:
+                # The tip may be on the other canvas, so redraw the one it is on.
+                self.tip.figure.canvas.draw_idle()
                 self.tip.remove()
                 self.tip = None
             data = self.hover.get(event.inaxes)
             if data and event.xdata is not None:
-                n, pts = data
-                x, t, ppm, trk = min(pts, key=lambda p: abs(p[0] - event.xdata))
+                unit, pts = data
+                x, t, v, trk = min(pts, key=lambda p: abs(p[0] - event.xdata))
                 text = "%s\n%s" % (datetime.fromtimestamp(t).strftime("%d %b %H:%M:%S"),
-                                   "no ppm (read fault)" if ppm is None else "%.2f ppm" % ppm)
+                                   "no ppm (read fault)" if v is None else "%.2f %s" % (v, unit))
                 if trk is False:
                     text += "\nprovisional"
                 ax = event.inaxes
-                y = ppm if ppm is not None else ax.get_ylim()[0]
+                y = v if v is not None else ax.get_ylim()[0]
                 left = event.x > ax.bbox.x0 + ax.bbox.width * 0.6
                 self.tip = ax.annotate(
                     text, (x, y), xytext=(-10 if left else 10, 10), textcoords="offset points",
                     ha="right" if left else "left", fontsize=8, color=INK, zorder=10,
                     bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=AXIS),
                     arrowprops=dict(arrowstyle="-", color=MUTED))
-            self.canvas.draw_idle()
+            event.canvas.draw_idle()
 
     root = tk.Tk()
     app = App(root)

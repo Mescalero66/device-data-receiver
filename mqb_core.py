@@ -221,7 +221,7 @@ def read_csv_logs(paths):
     once, and board restarts are found as they were live, even between files.
 
     Returns (points, restarts, skipped): points maps sensor -> time-ordered
-    [(rx_time, ppm, tracking)], restarts lists the times of detected board
+    [(rx_time, ppm, tracking, temp_c)], restarts lists the times of detected board
     restarts and skipped counts rows that could not be read. Raises
     ValueError for a file that is not an MQB CSV log.
     """
@@ -237,9 +237,10 @@ def read_csv_logs(paths):
                 try:
                     rx = datetime.strptime(row["pc_time"], TIME_FMT).timestamp()
                     ppm = float(row["ppm"]) if row["ppm"] else None
+                    temp = float(row["temp_c"]) if row.get("temp_c") else None
                     tracking = {"1": True, "0": False}.get(row.get("tracking") or "")
                     s = Sentence(row["sensor"], int(row["t_s"]), row.get("gas") or None,
-                                 ppm, None, tracking, None)
+                                 ppm, temp, tracking, None)
                 except (TypeError, ValueError):     # short or garbled row
                     skipped += 1
                     continue
@@ -253,7 +254,7 @@ def read_csv_logs(paths):
         if up.restart:
             restarts.append(rx)
         if up.reading:
-            points[s.name].append((rx, s.ppm, s.tracking))
+            points[s.name].append((rx, s.ppm, s.tracking, s.temp_c))
     return points, restarts, skipped
 
 

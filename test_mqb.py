@@ -231,7 +231,8 @@ class CsvTests(unittest.TestCase):
                 log.write(tr.feed(parse_sentence(text), now).reading)
             log.close()
             points, restarts, skipped = read_csv_logs([log.daily.path])
-        self.assertEqual(points["MQ4"], [(1.7e9, 17.85, True), (1.7e9 + 150, None, True)])
+        self.assertEqual(points["MQ4"], [(1.7e9, 17.85, True, 23.19),
+                                          (1.7e9 + 150, None, True, 23.19)])
         self.assertEqual((restarts, skipped), ([], 0))
 
     def test_import_dedup_restarts_and_bad_rows(self):
@@ -257,9 +258,9 @@ class CsvTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_csv_logs([other])
         t = lambda text: datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
-        self.assertEqual(points["MQ2"], [(t("2026-10-04 10:00:00"), 12.55, False),
-                                         (t("2026-10-04 10:02:30"), None, False),
-                                         (t("2026-10-05 09:00:00"), 13.0, False)])
+        self.assertEqual(points["MQ2"], [(t("2026-10-04 10:00:00"), 12.55, False, 18.38),
+                                         (t("2026-10-04 10:02:30"), None, False, 18.4),
+                                         (t("2026-10-05 09:00:00"), 13.0, False, 18.0)])
         self.assertEqual(len(points["MQ4"]), 1)
         self.assertEqual(restarts, [t("2026-10-05 09:00:00")])
         self.assertEqual(skipped, 1)
