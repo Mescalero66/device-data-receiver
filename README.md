@@ -1,7 +1,7 @@
 # Device Data Receiver
 
 PC software for the MQ gas sensor board's UART broadcast (`$PMQB` sentences,
-see [INTERFACE.md](INTERFACE.md)). It shows the six sensors live and appends
+see [https://github.com/Mescalero66/mq-board-micropython/blob/main/INTERFACE.md](INTERFACE.md)). It shows the six sensors live and appends
 every new reading to a daily CSV file.
 
 ## Setup
@@ -31,6 +31,7 @@ Double-click `run.bat`, or:
     python mqb_receiver.py --cli --port COM7    # console only (e.g. for long unattended logging)
     python mqb_receiver.py --sim                # simulated board, no hardware needed
     python mqb_receiver.py --sim --sim-faults   # simulated faults, bad checksums and a restart
+    python mqb_receiver.py data\mqb_2026-10-04.csv   # window showing an earlier log on the charts
 
 Other options: `--raw` also logs every received line verbatim; `--out DIR`
 changes the log folder (default `data/`); `--sim-speed N` speeds up the simulator.
@@ -44,6 +45,8 @@ The window shows:
 - **Charts**: ppm per sensor over the chosen window. Hollow circles are
   provisional readings (boot-calibration R0, `tracking=0`), red crosses are
   readings with no ppm, dotted lines are board restarts. Hover for values.
+  *Import CSV...* adds logs from earlier runs to the charts (see below);
+  *Clear charts* empties them without touching the log files.
 - **Events**: restarts, rejected lines (with the reason, e.g. checksum
   mismatch), deviations from the spec, stale sensors and link loss.
 - **Status line**: counts of lines, valid sentences, rejects and readings, plus
@@ -51,6 +54,23 @@ The window shows:
 
 If the port drops (e.g. the adapter is unplugged), the receiver keeps retrying
 until it comes back.
+
+### Viewing earlier logs
+
+*Import CSV...* (or CSV paths on the command line, or CSV files dropped onto
+`run.bat`) loads `mqb_*.csv` logs onto the charts, with or without a board
+connected. You can select several files at once. Imported readings are merged
+with whatever is already shown:
+
+- A reading already on the charts (e.g. importing today's file while logging)
+  is not added twice, and neither is one logged twice because the program was
+  restarted mid-cycle.
+- Board restarts are found from the `t_s` values, including between files
+  imported together, and drawn as dotted lines.
+- The chart window widens if needed to fit the imported data. When no board
+  is connected, the window ends at the newest reading rather than the present.
+
+Imported data only goes on the charts; it is never written back to the logs.
 
 ## Log files
 
@@ -80,7 +100,7 @@ or `REJECT ...`). This is useful for checking the firmware against the spec.
 | File               | Contents                                                        |
 |--------------------|-----------------------------------------------------------------|
 | `mqb_receiver.py`  | entry point: GUI and console mode                               |
-| `mqb_core.py`      | serial port, line framing, CSV/raw logs, background receiver    |
+| `mqb_core.py`      | serial port, line framing, CSV/raw logs and import, background receiver |
 | `mqb_protocol.py`  | sentence parsing and validation, new-reading/restart tracking   |
 | `mqb_sim.py`       | simulated board (`python mqb_sim.py` prints a sample stream)    |
 | `test_mqb.py`      | tests, including every example in INTERFACE.md: `python -m unittest -v` |

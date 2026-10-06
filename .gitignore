@@ -222,3 +222,5 @@ __marimo__/
 # Data Logs
 data/*.csv
 data/*.log
+data/sim/*.csv
+data/sim/*.log

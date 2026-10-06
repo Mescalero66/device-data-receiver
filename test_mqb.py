@@ -4,8 +4,9 @@ import csv
 import os
 import tempfile
 import unittest
+from datetime import datetime
 
-from mqb_core import CsvLogger, LineFramer
+from mqb_core import CsvLogger, LineFramer, read_csv_logs
 from mqb_protocol import (ParseError, Tracker, checksum, make_sentence, parse_sentence,
                           recompute_ppm)
 from mqb_sim import SimBoard
@@ -37,6 +38,10 @@ $PMQB,MQ4,51,CH4,2.87,22.44,0,10.000000*13
 $PMQB,MQ2,259226,SMK,14.10,23.44,1,0.611204*7B
 $PMQB,MQ2,26,SMK,14.08,23.50,1,0.611204*7B
 """.split()
+
+
+CSV_HEADER = ["pc_time", "board_time_est", "sensor", "gas", "t_s", "ppm",
+              "temp_c", "tracking", "r0_kohm", "flags"]
 
 
 def line(body):
@@ -216,6 +221,48 @@ class CsvTests(unittest.TestCase):
         self.assertEqual(rows[0]["r0_kohm"], "5.401877")
         self.assertEqual(rows[1]["ppm"], "")
         self.assertEqual(rows[1]["flags"], "no_ppm")
+
+    def test_round_trip(self):
+        tr = Tracker()
+        with tempfile.TemporaryDirectory() as d:
+            log = CsvLogger(d)
+            for text, now in (("$PMQB,MQ4,86451,CH4,17.85,23.19,1,5.401877*2E", 1.7e9 + 0.6),
+                              ("$PMQB,MQ4,86601,CH4,,23.19,1,5.401877*0C", 1.7e9 + 150.6)):
+                log.write(tr.feed(parse_sentence(text), now).reading)
+            log.close()
+            points, restarts, skipped = read_csv_logs([log.daily.path])
+        self.assertEqual(points["MQ4"], [(1.7e9, 17.85, True), (1.7e9 + 150, None, True)])
+        self.assertEqual((restarts, skipped), ([], 0))
+
+    def test_import_dedup_restarts_and_bad_rows(self):
+        header = ",".join(CSV_HEADER)
+        day1 = [header,
+                "2026-10-04 10:00:00,,MQ2,SMK,26,12.55,18.38,0,2.119942,provisional",
+                "2026-10-04 10:00:25,,MQ4,CH4,51,16.77,18.69,0,5.949737,provisional",
+                "2026-10-04 10:01:00,,MQ2,SMK,26,12.55,18.38,0,2.119942,provisional",  # relogged
+                "2026-10-04 10:02:30,,MQ2,SMK,176,,18.40,0,2.119942,no_ppm provisional",
+                "not a date,,MQ2,SMK,326,12.00,18.40,0,2.119942,"]
+        day2 = [header,
+                "2026-10-05 09:00:00,,MQ2,SMK,26,13.00,18.00,0,2.1,provisional"]   # rebooted
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for name, rows in (("b.csv", day2), ("a.csv", day1)):
+                paths.append(os.path.join(d, name))
+                with open(paths[-1], "w", newline="") as fh:
+                    fh.write("\r\n".join(rows) + "\r\n")
+            points, restarts, skipped = read_csv_logs(paths)
+            other = os.path.join(d, "other.csv")
+            with open(other, "w") as fh:
+                fh.write("time,value\n1,2\n")
+            with self.assertRaises(ValueError):
+                read_csv_logs([other])
+        t = lambda text: datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+        self.assertEqual(points["MQ2"], [(t("2026-10-04 10:00:00"), 12.55, False),
+                                         (t("2026-10-04 10:02:30"), None, False),
+                                         (t("2026-10-05 09:00:00"), 13.0, False)])
+        self.assertEqual(len(points["MQ4"]), 1)
+        self.assertEqual(restarts, [t("2026-10-05 09:00:00")])
+        self.assertEqual(skipped, 1)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from datetime import datetime
 import serial
 import serial.tools.list_ports
 
-from mqb_protocol import MAX_LINE, ParseError, Tracker, parse_sentence
+from mqb_protocol import MAX_LINE, SENSORS, ParseError, Sentence, Tracker, parse_sentence
 
 BAUD = 115200
 ESPRESSIF_VID = 0x303A
@@ -148,8 +148,11 @@ CSV_FIELDS = ["pc_time", "board_time_est", "sensor", "gas", "t_s", "ppm",
               "temp_c", "tracking", "r0_kohm", "flags"]
 
 
+TIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
 def _fmt_time(epoch):
-    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(epoch).strftime(TIME_FMT)
 
 
 def _fmt(v, spec):
@@ -208,6 +211,50 @@ class CsvLogger:
 
     def close(self):
         self.daily.close()
+
+
+def read_csv_logs(paths):
+    """Load readings back from CSV logs written by CsvLogger, for plotting.
+
+    Rows from all the files are replayed in time order through a Tracker, so
+    a reading logged twice (e.g. the program was restarted mid-cycle) counts
+    once, and board restarts are found as they were live, even between files.
+
+    Returns (points, restarts, skipped): points maps sensor -> time-ordered
+    [(rx_time, ppm, tracking)], restarts lists the times of detected board
+    restarts and skipped counts rows that could not be read. Raises
+    ValueError for a file that is not an MQB CSV log.
+    """
+    rows, skipped = [], 0
+    for path in paths:
+        with open(path, newline="", encoding="ascii", errors="replace") as fh:
+            reader = csv.DictReader(fh)
+            missing = {"pc_time", "sensor", "t_s", "ppm"} - set(reader.fieldnames or ())
+            if missing:
+                raise ValueError("%s is not an MQB CSV log (no %s column)"
+                                 % (os.path.basename(path), ", ".join(sorted(missing))))
+            for row in reader:
+                try:
+                    rx = datetime.strptime(row["pc_time"], TIME_FMT).timestamp()
+                    ppm = float(row["ppm"]) if row["ppm"] else None
+                    tracking = {"1": True, "0": False}.get(row.get("tracking") or "")
+                    s = Sentence(row["sensor"], int(row["t_s"]), row.get("gas") or None,
+                                 ppm, None, tracking, None)
+                except (TypeError, ValueError):     # short or garbled row
+                    skipped += 1
+                    continue
+                rows.append((rx, s))
+    rows.sort(key=lambda r: r[0])
+    tracker = Tracker()
+    points = {n: [] for n in SENSORS}
+    restarts = []
+    for rx, s in rows:
+        up = tracker.feed(s, rx)
+        if up.restart:
+            restarts.append(rx)
+        if up.reading:
+            points[s.name].append((rx, s.ppm, s.tracking))
+    return points, restarts, skipped
 
 
 class RawLogger:

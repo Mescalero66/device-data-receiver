@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import datetime
 
-from mqb_core import HealthWatch, Receiver, SerialSource, SimSource, list_ports
+from mqb_core import HealthWatch, Receiver, SerialSource, SimSource, list_ports, read_csv_logs
 from mqb_protocol import CLEAN_AIR_PPM, CYCLE_S, GAS, GAS_NAME, SENSORS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -118,7 +118,7 @@ MAX_HISTORY = 20000             # readings kept per sensor for plotting (~35 day
 
 def run_gui(args):
     import tkinter as tk
-    from tkinter import ttk
+    from tkinter import filedialog, messagebox, ttk
     from tkinter.scrolledtext import ScrolledText
 
     import matplotlib
@@ -142,6 +142,8 @@ def run_gui(args):
             self.hover = {}
             self._build()
             self._refresh_ports()
+            if args.csv:
+                self._import(args.csv)
             if args.sim:
                 self.port_var.set(SIM_LABEL)
                 self._connect()
@@ -212,6 +214,8 @@ def run_gui(args):
             self.log_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(ctl, text="Log scale", variable=self.log_var,
                             command=self._mark_dirty).pack(side="left", padx=8)
+            ttk.Button(ctl, text="Import CSV...", command=self._import).pack(side="left", padx=(8, 4))
+            ttk.Button(ctl, text="Clear charts", command=self._clear_charts).pack(side="left")
             ttk.Label(ctl, text="Hover a chart for values. Plotted at receive time (within ~10s of the reading).",
                       style="Status.TLabel").pack(side="right")
 
@@ -285,6 +289,76 @@ def run_gui(args):
             if self.rx:
                 self.rx.stop()
             self.root.destroy()
+
+        # imported logs ------------------------------------------------
+        def _import(self, paths=None):
+            if paths is None:
+                paths = filedialog.askopenfilenames(
+                    parent=self.root, title="Import CSV logs",
+                    initialdir=os.path.abspath(out_folder(args, self.port) if self.rx else args.out),
+                    filetypes=[("CSV logs", "*.csv"), ("All files", "*.*")])
+                if not paths:
+                    return
+            try:
+                points, restarts, skipped = read_csv_logs(paths)
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Import CSV", str(e), parent=self.root)
+                return
+            # Merge in time order. CSV times are whole seconds of the live
+            # receive time, so int() matches a reading already on the charts.
+            added = 0
+            for n, new in points.items():
+                h = self.history[n]
+                seen = {int(p[0]) for p in h}
+                fresh = [p for p in new if int(p[0]) not in seen]
+                added += len(fresh)
+                h.extend(fresh)
+                h.sort(key=lambda p: p[0])
+                del h[:-MAX_HISTORY]
+            # A live restart is logged on the first empty sentence, an imported
+            # one at the first reading after it, so allow for the difference.
+            for rt in restarts:
+                if all(abs(rt - r) > CYCLE_S for r in self.restarts):
+                    self.restarts.append(rt)
+            self.restarts.sort()
+
+            names = ", ".join(os.path.basename(p) for p in paths)
+            times = [p[0] for pts in points.values() for p in pts]
+            if not times:
+                self._add_log("warning", "no readings found in %s" % names)
+                return
+            total = len(times)
+            text = "imported %d readings from %s (%s to %s)" % (
+                added, names, datetime.fromtimestamp(min(times)).strftime("%d %b %H:%M"),
+                datetime.fromtimestamp(max(times)).strftime("%d %b %H:%M"))
+            if added < total:
+                text += ", %d already shown" % (total - added)
+            if restarts:
+                text += ", %d board restart(s)" % len(restarts)
+            if skipped:
+                text += ", %d unreadable row(s) skipped" % skipped
+            self._add_log("info", text)
+
+            # Widen the chart window if the imported data would not fit.
+            need = self._view_end(time.time()) - min(times)
+            span = dict(WINDOWS)[self.window_var.get()]
+            if span is not None and span < need:
+                self.window_var.set(next(w for w, s in WINDOWS if s is None or s >= need))
+            self._mark_dirty()
+
+        def _clear_charts(self):
+            for h in self.history.values():
+                h.clear()
+            self.restarts.clear()
+            self._add_log("info", "charts cleared (log files are unchanged)")
+            self._mark_dirty()
+
+        def _view_end(self, now):
+            """Charts end at the present while connected, else at the newest data."""
+            if self.rx:
+                return now
+            last = [h[-1][0] for h in self.history.values() if h]
+            return max(last) if last else now
 
         # data flow ----------------------------------------------------
         def _poll(self):
@@ -401,9 +475,9 @@ def run_gui(args):
 
         # charts -------------------------------------------------------
         def _draw(self):
-            now = time.time()
+            end = self._view_end(time.time())
             span = dict(WINDOWS)[self.window_var.get()]
-            t0 = now - span if span else None
+            t0 = end - span if span else None
             self.hover.clear()
             for ax, n in zip(self.axes.flat, SENSORS):
                 ax.clear()
@@ -451,7 +525,7 @@ def run_gui(args):
                 # empty 6 h axis for the first few minutes.
                 first = min(p[0] for h in self.history.values() for p in h[:1])
                 left = max(t0, first) if t0 is not None else first
-                ax.set_xlim(datetime.fromtimestamp(left - 60), datetime.fromtimestamp(now + 30))
+                ax.set_xlim(datetime.fromtimestamp(left - 60), datetime.fromtimestamp(end + 30))
                 self.hover[ax] = (n, [(mdates.date2num(datetime.fromtimestamp(e)), e, p, trk)
                                       for e, p, trk in pts])
             self.tip = None
@@ -502,6 +576,7 @@ def run_gui(args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Receive, display and log MQ gas sensor board broadcasts.")
+    p.add_argument("csv", nargs="*", help="CSV logs from earlier runs to show on the charts (window only)")
     p.add_argument("--port", help="serial port, e.g. COM7")
     p.add_argument("--cli", action="store_true", help="console only, no window")
     p.add_argument("--out", default=os.path.join(HERE, "data"), help="folder for CSV logs (default: ./data)")
@@ -512,6 +587,8 @@ def main(argv=None):
                    help="simulate a fresh board with read faults, corrupted lines, a failed MQ4 "
                         "boot calibration and a restart at 15 min uptime")
     args = p.parse_args(argv)
+    if args.cli and args.csv:
+        p.error("CSV import is only available in the window, not with --cli")
     return run_cli(args) if args.cli else run_gui(args)
 
 
